@@ -1,4 +1,5 @@
 Flask
 yfinance
 textblob
+flask-cors
 gunicorn
