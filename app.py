@@ -1,8 +1,10 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import yfinance as yf
 from textblob import TextBlob
 
 app = Flask(__name__)
+CORS(app)  # <-- allows all origins
 
 @app.route("/predict", methods=["POST"])
 def predict():
