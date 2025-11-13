@@ -4,22 +4,52 @@ import yfinance as yf
 from textblob import TextBlob
 
 app = Flask(__name__)
-CORS(app)  # <-- allows all origins
+CORS(app)  # allow all origins
 
 @app.route("/predict", methods=["POST"])
 def predict():
     data = request.json
-    symbol = data.get("symbol")
-    info = yf.Ticker(symbol).history(period="1mo")["Close"]
-    change = (info[-1] - info[0]) / info[0]
-    sentiment = TextBlob(symbol).sentiment.polarity
-    recommendation = "BUY" if change > 0 and sentiment >= 0 else "SELL"
-    return jsonify({
-        "symbol": symbol,
-        "price_change": round(change*100, 2),
-        "sentiment": sentiment,
-        "recommendation": recommendation
-    })
+    symbol = data.get("symbol", "").upper().strip()
+    
+    if not symbol:
+        return jsonify({"error": "No symbol provided"}), 400
+
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="1mo")
+        if hist.empty:
+            return jsonify({"error": "Invalid or unsupported symbol"}), 404
+
+        # Calculate basic stats
+        last_price = round(hist["Close"].iloc[-1], 2)
+        first_price = round(hist["Close"].iloc[0], 2)
+        price_change = round((last_price - first_price) / first_price * 100, 2)
+
+        # Sentiment (simple placeholder)
+        sentiment_score = round(TextBlob(symbol).sentiment.polarity, 2)
+        recommendation = "BUY" if price_change > 0 and sentiment_score >= 0 else "SELL"
+
+        # Optional: get some metadata (company name, market cap, etc.)
+        info = ticker.info
+        company_name = info.get("shortName", "Unknown")
+        market_price = info.get("regularMarketPrice", last_price)
+        currency = info.get("currency", "USD")
+        exchange = info.get("exchange", "N/A")
+
+        return jsonify({
+            "symbol": symbol,
+            "company_name": company_name,
+            "price_change": price_change,
+            "sentiment": sentiment_score,
+            "recommendation": recommendation,
+            "current_price": market_price,
+            "currency": currency,
+            "exchange": exchange
+        })
+
+    except Exception as e:
+        print("Prediction error:", e)
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run()
+    app.run(debug=True)
