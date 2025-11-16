@@ -50,6 +50,10 @@ def predict():
     except Exception as e:
         print("Prediction error:", e)
         return jsonify({"error": str(e)}), 500
+    
+@app.route("/api/ping", methods=["GET"])
+def ping():
+    return jsonify({"status": "awake"}), 200 
 
 if __name__ == "__main__":
     app.run(debug=True)
