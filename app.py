@@ -51,7 +51,7 @@ def predict():
         print("Prediction error:", e)
         return jsonify({"error": str(e)}), 500
     
-@app.route("/api/ping", methods=["GET"])
+@app.route("/predict/ping", methods=["GET"])
 def ping():
     return jsonify({"status": "awake"}), 200 
 
