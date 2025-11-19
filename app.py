@@ -1,3 +1,4 @@
+# app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yfinance as yf
@@ -5,16 +6,15 @@ import pandas as pd
 import numpy as np
 import traceback
 import time
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# ML
-from sklearn.ensemble import RandomForestClassifier
+# Forecasting (Holt-Winters)
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
 app = Flask(__name__)
-CORS(app)  # allow all origins
+CORS(app)
 
-# -------------------------
-# Utilities / indicators
-# -------------------------
+# ---------- Utilities / Indicators (pure pandas/numpy) ----------
 def sma(series: pd.Series, window: int):
     return series.rolling(window=window, min_periods=1).mean()
 
@@ -38,12 +38,64 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
-def pct_change(a, b):
-    if b == 0:
-        return 0.0
-    return (a - b) / b
+def bollinger_bands(series: pd.Series, window: int = 20, n_std: float = 2.0):
+    ma = series.rolling(window=window, min_periods=1).mean()
+    std = series.rolling(window=window, min_periods=1).std().fillna(0)
+    upper = ma + n_std * std
+    lower = ma - n_std * std
+    return ma, upper, lower
 
-# create features for ML: given a DataFrame with Close and optionally Volume
+def atr(df: pd.DataFrame, window: int = 14):
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(window=window, min_periods=1).mean().fillna(0)
+
+def stoch_oscillator(df: pd.DataFrame, k_window: int = 14, d_window: int = 3):
+    low_min = df['Low'].rolling(window=k_window, min_periods=1).min()
+    high_max = df['High'].rolling(window=k_window, min_periods=1).max()
+    k = 100 * ((df['Close'] - low_min) / (high_max - low_min + 1e-9))
+    d = k.rolling(window=d_window, min_periods=1).mean()
+    return k, d
+
+def percent_change(a, b):
+    return (a - b) / (b + 1e-9)
+
+# Simple candlestick heuristics (not exhaustive)
+def detect_candlestick_patterns(df: pd.DataFrame):
+    """
+    Returns a list of pattern messages (look-back one day for simplicity).
+    This is quick heuristic detection for common candles (hammer, shooting star, engulfing).
+    """
+    patterns = []
+    if len(df) < 2:
+        return patterns
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    body = abs(last['Close'] - last['Open'])
+    range_ = last['High'] - last['Low'] + 1e-9
+    upper_wick = last['High'] - max(last['Close'], last['Open'])
+    lower_wick = min(last['Close'], last['Open']) - last['Low']
+
+    # Hammer: small body near top? actually small body near top means small upper wick; hammer is small upper wick? typical hammer: small body at top with long lower wick
+    if lower_wick > (body * 2) and body / range_ < 0.3:
+        patterns.append("Hammer-like candle (possible short-term reversal).")
+    if upper_wick > (body * 2) and body / range_ < 0.3:
+        patterns.append("Shooting-star-like candle (possible near-term top).")
+    # Engulfing (bull/bear)
+    if (prev['Close'] < prev['Open']) and (last['Close'] > last['Open']) and (last['Close'] - last['Open'] > prev['Open'] - prev['Close']):
+        patterns.append("Bullish engulfing (bullish reversal signal).")
+    if (prev['Close'] > prev['Open']) and (last['Close'] < last['Open']) and (last['Open'] - last['Close'] > prev['Close'] - prev['Open']):
+        patterns.append("Bearish engulfing (bearish reversal signal).")
+
+    return patterns
+
+# Create features data frame used for heuristics / lightweight model
 def create_features(df: pd.DataFrame):
     out = pd.DataFrame(index=df.index)
     out['close'] = df['Close']
@@ -61,7 +113,19 @@ def create_features(df: pd.DataFrame):
     out['macd_signal'] = signal_line
     out['macd_hist'] = hist
 
-    # volume features if available
+    # stoch
+    k, d = stoch_oscillator(df)
+    out['stoch_k'] = k
+    out['stoch_d'] = d
+
+    # bollinger
+    ma20, bb_upper, bb_lower = bollinger_bands(df['Close'], 20, 2)
+    out['bb_mid'] = ma20
+    out['bb_upper'] = bb_upper
+    out['bb_lower'] = bb_lower
+
+    # ATR & vol
+    out['atr_14'] = atr(df, 14)
     if 'Volume' in df.columns:
         out['vol_mean_20'] = df['Volume'].rolling(window=20, min_periods=1).mean()
         out['vol'] = df['Volume']
@@ -69,46 +133,51 @@ def create_features(df: pd.DataFrame):
         out['vol_mean_20'] = 0.0
         out['vol'] = 0.0
 
-    # fill/clean
-    out = out.fillna(method='ffill').fillna(method='bfill').fillna(0)
-    return out
+    return out.fillna(method='ffill').fillna(method='bfill').fillna(0)
 
-def prepare_ml_dataset(features: pd.DataFrame, future_horizon=1, up_threshold=0.0):
-    """
-    Create X, y for supervised learning. y = 1 if close price in `future_horizon` days
-    is up by > up_threshold fraction (e.g., 0.0 means any positive move).
-    """
-    df = features.copy()
-    df['future_close'] = df['close'].shift(-future_horizon)
-    df.dropna(inplace=True)
-    df['label'] = (df['future_close'] > df['close'] * (1 + up_threshold)).astype(int)
-    X = df.drop(columns=['future_close', 'label'])
-    y = df['label']
-    return X, y
+# Forecast (Holt-Winters - additive)
+def holt_winters_forecast(series: pd.Series, periods: int = 7):
+    try:
+        # Use multiplicative if positive series with seasonal component; here use additive quick fallback
+        model = ExponentialSmoothing(series.dropna(), trend="add", seasonal=None, damped_trend=True)
+        fit = model.fit(optimized=True)
+        forecast = fit.forecast(periods)
+        return forecast.tolist()
+    except Exception:
+        # fallback: simple naive last value repeated or percent change trend
+        if len(series) >= 2:
+            last = series.iloc[-1]
+            prev = series.iloc[-2]
+            change = last - prev
+            return [(last + change * (i + 1)) for i in range(periods)]
+        else:
+            return [series.iloc[-1]] * periods
 
-# -------------------------
-# Long-term scoring helper
-# -------------------------
-def compute_long_term_view(hist: pd.DataFrame, info: dict, current_price: float):
-    """
-    Long-term (6–24 month) heuristic recommendation based on:
-    - 6m / 1y / full-period returns
-    - volatility
-    - simple fundamental metrics when available (P/E, dividend, beta, market cap)
-    Returns dict:
-      { recommendation, score, reasoning }
-    score ~ [0, 1] where higher = stronger long-term buy.
-    """
+# Simple sentiment on symbol + short news/title text using VADER
+sentiment_analyzer = SentimentIntensityAnalyzer()
+def simple_sentiment_from_text(text: str):
+    if not text:
+        return 0.0
+    scores = sentiment_analyzer.polarity_scores(text)
+    return round(scores['compound'], 3)
 
-    # Require at least ~6 months of data for a real long-term read
+# ---------- Long-term heuristic view ----------
+def compute_long_term_view(hist: pd.DataFrame, info: dict):
+    """
+    Long-term (6–24 month) heuristic recommendation:
+      - returns over 6mo/1y
+      - annualized volatility
+      - P/E, dividend yield, beta, marketCap
+    Returns dict with recommendation, score, reasoning, returns, volatility.
+    """
+    # need ~120 trading days (~6 months) ideally
     if len(hist) < 120:
         return {
             "recommendation": "NEUTRAL",
             "score": 0.5,
-            "reasoning": "Insufficient historical depth (< ~6 months) for a robust long-term view. Treat signal as neutral."
+            "reasoning": "Insufficient historical depth (< ~6 months) for strong long-term view."
         }
 
-    # Helper: get return over last n trading days
     def period_return(days):
         if len(hist) <= days:
             return None
@@ -116,126 +185,87 @@ def compute_long_term_view(hist: pd.DataFrame, info: dict, current_price: float)
         last_price = hist["Close"].iloc[-1]
         return float(round((last_price - past_price) / (past_price + 1e-9) * 100, 2))
 
-    ret_6m = period_return(126)   # ~6 months
-    ret_1y = period_return(252)   # ~1 year
+    ret_6m = period_return(126)
+    ret_1y = period_return(252)
     ret_full = float(round((hist["Close"].iloc[-1] - hist["Close"].iloc[0]) / (hist["Close"].iloc[0] + 1e-9) * 100, 2))
 
-    # Volatility: annualized std dev of daily returns
     daily_ret = hist["Close"].pct_change().dropna()
-    if len(daily_ret) > 0:
-        vol_annual = float(round(daily_ret.std() * np.sqrt(252) * 100, 2))  # in %
-    else:
-        vol_annual = None
+    vol_annual = float(round(daily_ret.std() * np.sqrt(252) * 100, 2)) if len(daily_ret) > 0 else None
 
     trailing_pe = info.get("trailingPE")
     forward_pe = info.get("forwardPE")
     dividend_yield = info.get("dividendYield")
     beta = info.get("beta")
 
-    # --- Score components ---
     score = 0.0
     components = []
 
-    # Trend (6m, 1y, full)
+    # trend
     if ret_6m is not None:
         if ret_6m > 0:
-            score += 0.15
-            components.append(f"6-month return is positive at {ret_6m}%.")
+            score += 0.15; components.append(f"6-month return positive: {ret_6m}%.")
         else:
-            score -= 0.15
-            components.append(f"6-month return is negative at {ret_6m}%.")
+            score -= 0.15; components.append(f"6-month return negative: {ret_6m}%.")
 
     if ret_1y is not None:
         if ret_1y > 0:
-            score += 0.2
-            components.append(f"1-year return is positive at {ret_1y}%.")
+            score += 0.2; components.append(f"1-year return positive: {ret_1y}%.")
         else:
-            score -= 0.2
-            components.append(f"1-year return is negative at {ret_1y}%.")
+            score -= 0.2; components.append(f"1-year return negative: {ret_1y}%.")
 
-    # full-period trend (over history_period)
     if ret_full > 0:
-        score += 0.1
-        components.append(f"Overall trend over the observed period is up {ret_full}%.")
+        score += 0.1; components.append(f"Trend over window: up {ret_full}%.")
     else:
-        score -= 0.1
-        components.append(f"Overall trend over the observed period is down {ret_full}%.")
+        score -= 0.1; components.append(f"Trend over window: down {ret_full}%.")
 
-    # Volatility: penalize very high volatility a bit for long-term conservative stance
     if vol_annual is not None:
-        components.append(f"Annualized volatility ~{vol_annual}%.")
+        components.append(f"Annualized vol ~{vol_annual}%.")
         if vol_annual > 60:
-            score -= 0.15
-            components.append("Volatility is very high, which increases long-term risk.")
+            score -= 0.15; components.append("Very high volatility — more risk long-term.")
         elif vol_annual > 40:
-            score -= 0.08
-            components.append("Volatility is elevated, which slightly reduces long-term attractiveness.")
+            score -= 0.08; components.append("Elevated volatility.")
         elif vol_annual < 25:
-            score += 0.05
-            components.append("Volatility is relatively moderate, which is favorable for long-term investors.")
+            score += 0.05; components.append("Moderate volatility — favorable for long-term.")
 
-    # Fundamentals: P/E
+    # fundamentals
     if trailing_pe is not None and trailing_pe > 0:
-        # Very high P/E: possibly overvalued (unless high-growth)
         if trailing_pe > 40:
-            score -= 0.1
-            components.append(f"Trailing P/E ~{round(trailing_pe,1)}, which is quite high and may indicate rich valuation.")
+            score -= 0.1; components.append(f"Trailing P/E ~{round(trailing_pe,1)} (high).")
         elif 15 <= trailing_pe <= 30:
-            score += 0.05
-            components.append(f"Trailing P/E ~{round(trailing_pe,1)}, within a typical growth/value range.")
+            score += 0.05; components.append(f"Trailing P/E ~{round(trailing_pe,1)} (typical).")
         elif trailing_pe < 10:
-            score += 0.03
-            components.append(f"Trailing P/E ~{round(trailing_pe,1)}, potentially undervalued if earnings are stable.")
-        else:
-            components.append(f"Trailing P/E ~{round(trailing_pe,1)}.")
+            score += 0.03; components.append(f"Trailing P/E ~{round(trailing_pe,1)} (low).")
 
-    # Forward P/E (if available)
-    if forward_pe is not None and forward_pe > 0:
-        if trailing_pe and forward_pe < trailing_pe:
-            score += 0.05
-            components.append("Forward P/E is lower than trailing P/E, suggesting expected earnings growth.")
+    if forward_pe is not None and forward_pe > 0 and trailing_pe and forward_pe < trailing_pe:
+        score += 0.05; components.append("Forward P/E lower than trailing — earnings expected to improve.")
 
-    # Dividend yield
-    if dividend_yield is not None and dividend_yield > 0:
+    if dividend_yield and dividend_yield > 0:
         dy_pct = round(dividend_yield * 100, 2)
         components.append(f"Dividend yield ~{dy_pct}%.")
         if 1.5 <= dy_pct <= 6:
-            score += 0.05
-            components.append("Dividend yield is in a typical sustainable range for long-term holders.")
-        elif dy_pct > 8:
-            components.append("Very high dividend yield could signal additional risk or an unsustainable payout.")
+            score += 0.05; components.append("Sustainable dividend range — positive for long-term.")
 
-    # Beta: risk relative to market
-    if beta is not None:
-        components.append(f"Beta ~{round(beta,2)}, indicating volatility relative to the broad market.")
+    if beta:
+        components.append(f"Beta ~{round(beta,2)}.")
         if beta > 1.4:
             score -= 0.05
-            components.append("High beta implies the stock is more volatile than the market.")
         elif beta < 0.8:
             score += 0.03
-            components.append("Lower beta suggests more defensive behavior vs. the broad market.")
 
-    # Normalize score into 0–1
-    # Score roughly ranges around [-0.6, +0.6], clamp and scale.
+    # normalize to [0,1] from approx [-0.8,0.8]
     score = max(-0.8, min(0.8, score))
-    norm_score = (score + 0.8) / 1.6  # map [-0.8,0.8] -> [0,1]
+    norm = (score + 0.8) / 1.6
 
-    # Turn into recommendation
-    if norm_score >= 0.65:
-        rec = "LONG-TERM BUY"
-    elif norm_score >= 0.45:
-        rec = "HOLD / ACCUMULATE"
-    elif norm_score >= 0.30:
-        rec = "NEUTRAL / WATCH"
-    else:
-        rec = "AVOID / HIGH RISK"
+    if norm >= 0.65: rec = "LONG-TERM BUY"
+    elif norm >= 0.45: rec = "HOLD / ACCUMULATE"
+    elif norm >= 0.30: rec = "NEUTRAL / WATCH"
+    else: rec = "AVOID / HIGH RISK"
 
-    components.append("This view is oriented toward a 6–24 month horizon based on price trend, volatility, and simple valuation metrics.")
+    components.append("This view is targeted for 6–24 months (long-term).")
     reasoning = " ".join(components)
-
     return {
         "recommendation": rec,
-        "score": float(round(norm_score, 3)),
+        "score": float(round(norm, 3)),
         "reasoning": reasoning,
         "returns": {
             "six_month_return_pct": ret_6m,
@@ -245,164 +275,145 @@ def compute_long_term_view(hist: pd.DataFrame, info: dict, current_price: float)
         "volatility_annual_pct": vol_annual
     }
 
-# -------------------------
-# Main prediction endpoint
-# -------------------------
+# ---------- Main prediction endpoint ----------
 @app.route("/predict", methods=["POST"])
 def predict():
     start_time = time.time()
     data = request.json or {}
     symbol = (data.get("symbol") or "").upper().strip()
-    horizon = int(data.get("horizon", 1))          # days ahead to label (default 1)
-    up_threshold = float(data.get("up_threshold", 0.0))  # threshold for "up" label
-    history_period = data.get("history_period", "2y")    # e.g., "1y", "2y", "6mo"
-    return_graph_points = int(data.get("graph_points", 120))  # how many points to return
+    history_period = data.get("history_period", "2y")  # "6mo", "1y", "2y"
+    graph_points = int(data.get("graph_points", 120))
+    forecast_days = int(data.get("forecast_days", 7))  # how many days to forecast
 
     if not symbol:
         return jsonify({"error": "No symbol provided"}), 400
 
     try:
         ticker = yf.Ticker(symbol)
-        # fetch daily history (adjusted close already in Close)
+        # fetch daily OHLCV
         hist = ticker.history(period=history_period, auto_adjust=False)
         if hist.empty or 'Close' not in hist.columns:
-            return jsonify({"error": "Invalid or unsupported symbol or no history available"}), 404
+            return jsonify({"error": "Invalid/unsupported symbol or no history"}), 404
 
-        # Resample/ensure daily frequency (market days); use what's returned
         hist = hist.sort_index()
-
-        # Basic price values
-        last_close = float(round(hist['Close'].iloc[-1], 2))
-        first_close = float(round(hist['Close'].iloc[0], 2))
+        close = hist['Close']
+        last_close = float(round(close.iloc[-1], 2))
+        first_close = float(round(close.iloc[0], 2))
         total_change_pct = round((last_close - first_close) / (first_close + 1e-9) * 100, 2)
 
-        # Compute indicators and features
-        features = create_features(hist)
-        # For graphs, select the most recent `return_graph_points`
-        graph_df = features.tail(return_graph_points).copy()
-
-        # Build ML dataset (label next-day movement)
-        X, y = prepare_ml_dataset(features, future_horizon=horizon, up_threshold=up_threshold)
-
-        model_info = {}
-        model_prediction = None
-        model_prob = None
-        feature_importances = {}
-
-        # Only train if enough rows
-        if len(X) >= 50 and len(y.unique()) > 1:
-            # train/test split using the earlier rows to avoid lookahead leakage
-            split_idx = int(len(X) * 0.8)
-            X_train = X.iloc[:split_idx]
-            y_train = y.iloc[:split_idx]
-            X_test = X.iloc[split_idx:]
-            y_test = y.iloc[split_idx:]
-
-            # small, fast model
-            clf = RandomForestClassifier(n_estimators=80, random_state=42, n_jobs=1)
-            clf.fit(X_train, y_train)
-
-            # predict for the latest available day (the row corresponding to last index)
-            latest_feat = X.iloc[[-1]]
-            pred_proba = float(clf.predict_proba(latest_feat)[0, 1]) if hasattr(clf, "predict_proba") else None
-            pred_label = int(clf.predict(latest_feat)[0])
-
-            model_prediction = int(pred_label)
-            model_prob = pred_proba
-            # feature importances (align to feature names)
-            importances = clf.feature_importances_
-            feature_importances = {col: float(round(val, 6)) for col, val in zip(X.columns, importances)}
-            model_info['trained'] = True
-            model_info['train_rows'] = len(X_train)
-            model_info['test_rows'] = len(X_test)
-        else:
-            # Not enough data to train or no label variety - fallback to heuristic
-            model_info['trained'] = False
-            # Heuristic: if short-term return positive and momentum indicators positive -> buy
-            last_row = features.iloc[-1]
-            score = 0.0
-            # price momentum
-            if last_row['return_1'] > 0:
-                score += 0.4
-            # rsi not overbought
-            if last_row['rsi_14'] < 70:
-                score += 0.2
-            # macd_hist positive
-            if last_row['macd_hist'] > 0:
-                score += 0.3
-            # sma relative
-            if last_row['close'] > last_row['sma_20']:
-                score += 0.2
-            # normalize
-            score = max(0.0, min(1.0, score))
-            model_prediction = 1 if score >= 0.5 else 0
-            model_prob = float(round(score, 3))
-            feature_importances = {}
-            model_info['heuristic_score'] = float(round(score, 3))
-
-        # ------------------ Fundamentals ------------------
-        info = {}
+        # fundamentals from yfinance
+        info_raw = {}
         try:
             info_raw = ticker.info or {}
-            info['shortName'] = info_raw.get('shortName')
-            info['marketCap'] = info_raw.get('marketCap')
-            info['trailingPE'] = info_raw.get('trailingPE')
-            info['forwardPE'] = info_raw.get('forwardPE')
-            info['dividendYield'] = info_raw.get('dividendYield')
-            info['beta'] = info_raw.get('beta')
-            info['sector'] = info_raw.get('sector')
         except Exception:
-            info = {}
+            info_raw = {}
+        fundamentals = {
+            "shortName": info_raw.get("shortName"),
+            "marketCap": info_raw.get("marketCap"),
+            "trailingPE": info_raw.get("trailingPE"),
+            "forwardPE": info_raw.get("forwardPE"),
+            "dividendYield": info_raw.get("dividendYield"),
+            "beta": info_raw.get("beta"),
+            "sector": info_raw.get("sector"),
+            "currency": info_raw.get("currency"),
+            "exchange": info_raw.get("exchange")
+        }
 
-        # ------------------ Short-term reasoning ------------------
-        short_reason = []
-        if model_prob is not None:
-            short_reason.append(
-                f"Model predicts next-{horizon} trading-day direction with probability {model_prob:.3f} for 'UP'."
-            )
+        # quick sentiment: analyze ticker shortName + longName if available (lightweight)
+        combined_text = " ".join([str(fundamentals.get("shortName") or ""), str(info_raw.get("longName") or ""), symbol])
+        sentiment_score = simple_sentiment_from_text(combined_text)
+
+        # features / indicators
+        features = create_features(hist)
+        graph_df = features.tail(graph_points).copy()
+
+        # candlestick patterns
+        patterns = detect_candlestick_patterns(hist)
+
+        # Short-term heuristic scoring (multi-factor)
+        last = features.iloc[-1]
+        score_components = []
+        score = 0.0
+        weight_total = 0.0
+
+        # Momentum: 1-day and 7-day return
+        r1 = last['return_1']
+        r7 = last['return_7']
+        if r1 > 0:
+            score += 0.35; score_components.append("Positive 1-day momentum")
         else:
-            short_reason.append("Model produced a heuristic short-term score instead of a trained probability.")
+            score -= 0.20; score_components.append("Negative 1-day momentum")
+        weight_total += 0.35
 
-        short_reason.append(
-            f"Short-term (last {len(features)} trading days in the selected window) price change: "
-            f"{total_change_pct}% (from {first_close} to {last_close})."
-        )
+        # RSI: prefer range 30-70; <30 oversold (+), >70 overbought (-)
+        rsi_val = last['rsi_14']
+        if rsi_val < 30:
+            score += 0.2; score_components.append("RSI indicates oversold (support for short-term buy)")
+        elif rsi_val > 70:
+            score -= 0.2; score_components.append("RSI indicates overbought (caution)")
+        else:
+            score += 0.05; score_components.append("RSI neutral")
+        weight_total += 0.2
 
-        if info.get('shortName'):
-            short_reason.append(f"Company: {info.get('shortName')}.")
+        # MACD histogram positive = momentum
+        if last['macd_hist'] > 0:
+            score += 0.2; score_components.append("Positive MACD histogram (bullish momentum)")
+        else:
+            score -= 0.1; score_components.append("Negative MACD histogram (bearish momentum)")
+        weight_total += 0.2
 
-        if info.get('marketCap'):
-            mc = info.get('marketCap')
-            # friendly market cap
-            def human_cap(x):
-                if x >= 1e12: return f"{round(x/1e12,2)}T"
-                if x >= 1e9: return f"{round(x/1e9,2)}B"
-                if x >= 1e6: return f"{round(x/1e6,2)}M"
-                return str(x)
-            short_reason.append(f"Market cap: {human_cap(mc)}.")
+        # Bollinger position: close above mid -> bullish
+        if last['close'] > last['bb_mid']:
+            score += 0.1; score_components.append("Price above 20-day mid (bullish)")
+        else:
+            score -= 0.05; score_components.append("Price below 20-day mid (bearish)")
+        weight_total += 0.1
 
-        last_row = features.iloc[-1]
-        short_reason.append(
-            f"SMA(20) = {round(last_row['sma_20'],2)}, EMA(20) = {round(last_row['ema_20'],2)}, "
-            f"RSI(14) = {round(last_row['rsi_14'],2)}."
-        )
-        short_reason.append(
-            f"MACD histogram = {round(last_row['macd_hist'],4)}; 1-day return = {round(last_row['return_1']*100,2)}%."
-        )
+        # Volume confirmation: higher than mean -> supports move
+        if last['vol'] > last['vol_mean_20'] and last['vol_mean_20'] > 0:
+            score += 0.1; score_components.append("Volume above 20-day mean confirming move")
+        weight_total += 0.1
 
-        short_horizon_hint = (
-            "This **short-term** recommendation is oriented toward the next trading day to roughly the next week, "
-            "driven by recent price momentum and technical indicators."
-        )
-        short_reason.append(short_horizon_hint)
-        short_reasoning = " ".join(short_reason)
+        # sentiment small tilt
+        if sentiment_score > 0.2:
+            score += 0.05; score_components.append("Positive sentiment signal")
+        elif sentiment_score < -0.2:
+            score -= 0.05; score_components.append("Negative sentiment signal")
+        weight_total += 0.05
 
-        short_rec = "BUY" if model_prediction == 1 else "SELL/AVOID"
+        # candlestick patterns
+        if patterns:
+            # if there's a bullish pattern, nudge score
+            for p in patterns:
+                if "Bullish" in p or "Hammer" in p:
+                    score += 0.05; score_components.append(p)
+                if "Bearish" in p or "Shooting" in p:
+                    score -= 0.05; score_components.append(p)
+        weight_total += 0.05
 
-        # ------------------ Long-term view ------------------
-        long_term_view = compute_long_term_view(hist, info, last_close)
+        # normalize into [0,1] where 0 = strong sell, 1 = strong buy
+        # current raw score roughly in [-1.0, +1.5] depending; map via sigmoid-like
+        raw = score
+        # simple normalization: scale by expected max weight_total
+        normalized = (raw + weight_total) / (2 * weight_total + 1e-9)
+        normalized = float(max(0.0, min(1.0, normalized)))
+        confidence = round(normalized, 3)
 
-        # ------------------ Chart data ------------------
+        short_rec = "BUY" if normalized >= 0.6 else ("HOLD" if normalized >= 0.4 else "SELL")
+
+        # Forecast (short-term next few days)
+        forecast_series = None
+        try:
+            # use Close series for forecast
+            forecast_series = holt_winters_forecast(close, periods=forecast_days)
+            forecast_series = [round(float(x), 4) for x in forecast_series]
+        except Exception:
+            forecast_series = []
+
+        # Long-term heuristic
+        long_term = compute_long_term_view(hist, fundamentals)
+
+        # Build chart payload
         chart = {
             "dates": [d.strftime("%Y-%m-%d") for d in graph_df.index],
             "close": [float(round(x, 4)) for x in graph_df['close'].tolist()],
@@ -411,31 +422,30 @@ def predict():
             "ema_20": [float(round(x, 4)) for x in graph_df['ema_20'].tolist()],
             "rsi_14": [float(round(x, 4)) for x in graph_df['rsi_14'].tolist()],
             "macd_hist": [float(round(x, 6)) for x in graph_df['macd_hist'].tolist()],
+            "bb_upper": [float(round(x,4)) for x in graph_df['bb_upper'].tolist()],
+            "bb_lower": [float(round(x,4)) for x in graph_df['bb_lower'].tolist()],
         }
 
-        # ------------------ Final payload ------------------
+        reasoning_short = (
+            f"Short-term reasoning: normalized confidence {confidence}. "
+            + " ".join(score_components)
+        )
+
         payload = {
             "symbol": symbol,
             "current_price": last_close,
             "price_change_pct_history": total_change_pct,
-
-            # SHORT TERM
             "short_term": {
                 "recommendation": short_rec,
-                "probability_up": model_prob,
-                "predicted_label": int(model_prediction),
-                "reasoning": short_reasoning,
+                "confidence": confidence,
+                "reasoning": reasoning_short,
+                "components": score_components,
+                "forecast_next_days": forecast_series,
+                "sentiment_compound": sentiment_score,
+                "candlestick_patterns": patterns
             },
-
-            # LONG TERM
-            "long_term": long_term_view,
-
-            "model": {
-                "trained": model_info.get('trained', False),
-                "feature_importances": feature_importances,
-                "meta": model_info,
-            },
-            "fundamentals": info,
+            "long_term": long_term,
+            "fundamentals": fundamentals,
             "chart": chart,
             "timestamp": int(time.time()),
             "duration_seconds": round(time.time() - start_time, 3)
@@ -446,7 +456,6 @@ def predict():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/predict/ping", methods=["GET"])
 def ping():

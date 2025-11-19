@@ -1,8 +1,8 @@
-Flask
-yfinance
-textblob
-flask-cors
-gunicorn
-scikit-learn
-pandas
-numpy
+Flask==2.3.3
+flask-cors==3.0.10
+pandas==2.2.2
+numpy==1.26.4
+yfinance==0.2.27
+vaderSentiment==3.3.2
+statsmodels==0.14.2
+gunicorn==23.2.0
