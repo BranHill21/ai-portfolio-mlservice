@@ -3,3 +3,6 @@ yfinance
 textblob
 flask-cors
 gunicorn
+scikit-learn
+pandas
+numpy
