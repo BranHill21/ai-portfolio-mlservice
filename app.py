@@ -457,6 +457,181 @@ def predict():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+@app.route("/predict/simple", methods=["POST"])
+def predict_simple():
+    data = request.json or {}
+    symbol = (data.get("symbol") or "").upper().strip()
+
+    if not symbol:
+        return jsonify({"error": "No symbol provided"}), 400
+
+    try:
+        # Fast pull: 3 months is enough for indicators but still quick
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="3mo", auto_adjust=False)
+
+        if hist.empty or "Close" not in hist.columns:
+            return jsonify({"error": "Invalid/unsupported symbol"}), 404
+
+        hist = hist.sort_index()
+        close = hist["Close"]
+        last_close = float(round(close.iloc[-1], 2))
+
+        # ------------------ FAST INDICATORS ------------------
+        df = hist.copy()
+
+        # Momentum
+        df["return_1"] = df["Close"].pct_change(1).fillna(0)
+        df["return_7"] = df["Close"].pct_change(7).fillna(0)
+
+        # RSI
+        def fast_rsi(series, window=14):
+            delta = series.diff()
+            gain = delta.clip(lower=0).rolling(window).mean()
+            loss = -delta.clip(upper=0).rolling(window).mean()
+            rs = gain / (loss + 1e-9)
+            return 100 - (100 / (1 + rs))
+
+        df["rsi_14"] = fast_rsi(df["Close"])
+
+        # MACD histogram (quick)
+        fast_ema = df["Close"].ewm(span=12, adjust=False).mean()
+        slow_ema = df["Close"].ewm(span=26, adjust=False).mean()
+        macd_line = fast_ema - slow_ema
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        df["macd_hist"] = macd_line - signal_line
+
+        # Stochastic (fast)
+        low_min = df["Low"].rolling(14).min()
+        high_max = df["High"].rolling(14).max()
+        df["stoch_k"] = 100 * ((df["Close"] - low_min) / (high_max - low_min + 1e-9))
+
+        # Volume confirmation
+        if "Volume" in df.columns:
+            df["vol_mean_20"] = df["Volume"].rolling(20).mean()
+        else:
+            df["vol_mean_20"] = 0
+
+        last = df.iloc[-1]
+
+        # -----------------------------------------------------
+        # SHORT-TERM SCORING (FASTEST POSSIBLE)
+        # -----------------------------------------------------
+        score = 0.0
+        notes = []
+
+        # 1-day momentum
+        if last["return_1"] > 0:
+            score += 0.25; notes.append("Positive 1-day momentum")
+        else:
+            score -= 0.15; notes.append("Negative 1-day momentum")
+
+        # 7-day momentum
+        if last["return_7"] > 0:
+            score += 0.25; notes.append("Positive 7-day momentum")
+        else:
+            score -= 0.15; notes.append("Negative 7-day momentum")
+
+        # RSI
+        if last["rsi_14"] < 30:
+            score += 0.25; notes.append("RSI oversold (bullish)")
+        elif last["rsi_14"] > 70:
+            score -= 0.25; notes.append("RSI overbought (bearish)")
+        else:
+            score += 0.05; notes.append("RSI neutral")
+
+        # MACD histogram
+        if last["macd_hist"] > 0:
+            score += 0.2; notes.append("MACD histogram positive")
+        else:
+            score -= 0.1; notes.append("MACD histogram negative")
+
+        # Stochastic K
+        if last["stoch_k"] < 20:
+            score += 0.2; notes.append("Stochastic oversold")
+        elif last["stoch_k"] > 80:
+            score -= 0.2; notes.append("Stochastic overbought")
+
+        # Volume confirmation
+        if last["Volume"] > last["vol_mean_20"]:
+            score += 0.1; notes.append("Volume above average")
+
+        # normalize to [0,1]
+        normalized = (score + 1.5) / 3.0
+        normalized = max(0.0, min(1.0, normalized))
+
+        short_rec = "BUY" if normalized >= 0.6 else ("HOLD" if normalized >= 0.4 else "SELL")
+
+        # -----------------------------------------------------
+        # ULTRA-FAST LONG-TERM VIEW
+        # Only uses 6-month return + volatility (VERY FAST)
+        # -----------------------------------------------------
+        try:
+            long_hist = ticker.history(period="6mo", auto_adjust=False)
+            long_hist = long_hist.sort_index()
+
+            if len(long_hist) > 30:
+                past = long_hist["Close"].iloc[0]
+                now = long_hist["Close"].iloc[-1]
+                six_month_return = float(round(((now - past) / (past + 1e-9)) * 100, 2))
+
+                vol = long_hist["Close"].pct_change().dropna().std() * np.sqrt(252)
+                vol = float(round(vol * 100, 2))
+
+                long_score = 0.5
+                if six_month_return > 0:
+                    long_score += 0.15
+                else:
+                    long_score -= 0.15
+
+                if vol < 25:
+                    long_score += 0.1
+                elif vol > 40:
+                    long_score -= 0.1
+
+                long_score = max(0, min(1, long_score))
+
+                if long_score >= 0.65:
+                    long_rec = "LONG-TERM BUY"
+                elif long_score >= 0.45:
+                    long_rec = "HOLD / ACCUMULATE"
+                else:
+                    long_rec = "NEUTRAL / WATCH"
+
+            else:
+                long_rec = "NEUTRAL"
+                long_score = 0.5
+                six_month_return = None
+                vol = None
+
+        except Exception:
+            long_rec = "NEUTRAL"
+            long_score = 0.5
+            six_month_return = None
+            vol = None
+
+        # -----------------------------------------------------
+        # RETURN
+        # -----------------------------------------------------
+        return jsonify({
+            "symbol": symbol,
+            "current_price": last_close,
+            "short_term": {
+                "recommendation": short_rec,
+                "confidence": round(float(normalized), 3),
+                "reasoning": notes
+            },
+            "long_term": {
+                "recommendation": long_rec,
+                "confidence": round(float(long_score), 3),
+                "six_month_return_pct": six_month_return,
+                "annual_volatility_pct": vol
+            }
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
 @app.route("/predict/ping", methods=["GET"])
 def ping():
     return jsonify({"status": "awake"}), 200
