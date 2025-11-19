@@ -164,7 +164,7 @@ def simple_sentiment_from_text(text: str):
 # ---------- Long-term heuristic view ----------
 def compute_long_term_view(hist: pd.DataFrame, info: dict):
     """
-    Long-term (6–24 month) heuristic recommendation:
+    Long-term (6-24 month) heuristic recommendation:
       - returns over 6mo/1y
       - annualized volatility
       - P/E, dividend yield, beta, marketCap
@@ -261,7 +261,7 @@ def compute_long_term_view(hist: pd.DataFrame, info: dict):
     elif norm >= 0.30: rec = "NEUTRAL / WATCH"
     else: rec = "AVOID / HIGH RISK"
 
-    components.append("This view is targeted for 6–24 months (long-term).")
+    components.append("This view is targeted for 6-24 months (long-term).")
     reasoning = " ".join(components)
     return {
         "recommendation": rec,
