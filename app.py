@@ -422,8 +422,16 @@ def predict():
             "ema_20": [float(round(x, 4)) for x in graph_df['ema_20'].tolist()],
             "rsi_14": [float(round(x, 4)) for x in graph_df['rsi_14'].tolist()],
             "macd_hist": [float(round(x, 6)) for x in graph_df['macd_hist'].tolist()],
+            "macd_signal": [float(round(x, 6)) for x in graph_df['macd_signal'].tolist()],
+            "macd": [float(round(x, 6)) for x in graph_df['macd'].tolist()],
             "bb_upper": [float(round(x,4)) for x in graph_df['bb_upper'].tolist()],
+            "bb_mid": [float(round(x,4)) for x in graph_df['bb_mid'].tolist()],
             "bb_lower": [float(round(x,4)) for x in graph_df['bb_lower'].tolist()],
+            "stoch_k": [float(round(x, 6)) for x in graph_df['stoch_k'].tolist()],
+            "stoch_d": [float(round(x, 6)) for x in graph_df['stoch_d'].tolist()],
+            "atr_14": [float(round(x, 6)) for x in graph_df['atr_14'].tolist()],
+            "vol_mean_20": [float(round(x, 6)) for x in graph_df['vol_mean_20'].tolist()],
+            "vol": [float(round(x, 6)) for x in graph_df['vol'].tolist()],
         }
 
         reasoning_short = (
